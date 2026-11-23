@@ -30,6 +30,8 @@ class Run(Base):
     status: Mapped[str] = mapped_column(String(20), default=Status.QUEUED, index=True)
     params: Mapped[dict] = mapped_column(JSON)
     result: Mapped[dict | None] = mapped_column(JSON)
+    # 抗干扰复核的分批检查点：记录已枚举到的档级、偏移和判定数，中断后续跑且不新增判定。
+    interference_checkpoint: Mapped[dict | None] = mapped_column(JSON)
     error: Mapped[str | None] = mapped_column(String(500))
     export_file: Mapped[str | None] = mapped_column(String(100))
     review: Mapped[str] = mapped_column(String(20), default=Review.PENDING)

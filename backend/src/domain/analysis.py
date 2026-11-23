@@ -65,6 +65,9 @@ def _run_parameters(params):
         raise ValueError("滞后扫描参数格式无效。")
     values = {}
     for field in SPEC["params"]:
+        if field["type"] != "int":
+            # 开关类参数（如抗干扰检查）不参与网格与扫描计算。
+            continue
         key = field["key"]
         value = params.get(key, field["default"])
         if type(value) is not int or not field["min"] <= value <= field["max"]:
@@ -120,7 +123,7 @@ def _pearson(pairs):
 
 
 def _lag_row(lag, fan, sound, span, sample_seconds, min_pairs):
-    pairs = [(value, sound[slot + lag]) for slot, value in fan.items() if slot + lag in sound]
+    pairs = lag_pairs(lag, fan, sound)
     count = len(pairs)
     possible = max(span - abs(lag), 0)
     coefficient = _pearson(pairs) if count >= min_pairs else None
@@ -142,6 +145,22 @@ def _lag_row(lag, fan, sound, span, sample_seconds, min_pairs):
         "pearson_r": coefficient,
         "status": status,
     }
+
+
+def lag_pairs(lag, fan, sound):
+    """沿用原口径：配对风机 F(t) 与声级 S(t+滞后)，仅取两路均有读数的时刻。"""
+    return [(value, sound[slot + lag]) for slot, value in fan.items() if slot + lag in sound]
+
+
+def _peak_key(row):
+    # 与 analyze 保持一致：|r|（12 位小数比较）、配对数、绝对滞后、滞后值。
+    return (round(abs(row["pearson_r"]), 12), row["pair_count"], -abs(row["lag_samples"]), -row["lag_samples"])
+
+
+def select_peak(lag_rows):
+    """原峰判法：只在可计算档位中选峰，全部不可计算时无峰。"""
+    valid = [row for row in lag_rows if row["pearson_r"] is not None]
+    return max(valid, key=_peak_key, default=None)
 
 
 def _table(title, columns, rows):
@@ -172,7 +191,8 @@ def _interpret(peak, max_lag):
     )
 
 
-def analyze(rows, normalized_params):
+def build_grid(rows, normalized_params):
+    """校验输入并落到固定采样网格，返回分析所需的全部中间量。"""
     readings = validate_rows(rows)
     options = _run_parameters(normalized_params)
     interval, max_lag, min_pairs = (options[key] for key in ("sample_seconds", "max_lag", "min_pairs"))
@@ -181,11 +201,25 @@ def analyze(rows, normalized_params):
         {slot: record[key] for slot, record in grid.items() if record[key] is not None}
         for key, _ in _CHANNELS
     )
-    lags = [_lag_row(lag, fan, sound, span, interval, min_pairs) for lag in range(-max_lag, max_lag + 1)]
+    return {
+        "readings": readings, "options": options, "start": start, "grid": grid, "span": span,
+        "fan": fan, "sound": sound, "interval": interval, "max_lag": max_lag, "min_pairs": min_pairs,
+    }
+
+
+def scan_lags(fan, sound, span, interval, max_lag, min_pairs):
+    """对 −N 到 +N 各档统一计算，抗干扰复核沿用同一套档位与口径。"""
+    return [_lag_row(lag, fan, sound, span, interval, min_pairs) for lag in range(-max_lag, max_lag + 1)]
+
+
+def analyze(rows, normalized_params):
+    prepared = build_grid(rows, normalized_params)
+    readings, options = prepared["readings"], prepared["options"]
+    interval, max_lag, min_pairs = (options[key] for key in ("sample_seconds", "max_lag", "min_pairs"))
+    start, grid, span, fan, sound = (prepared[key] for key in ("start", "grid", "span", "fan", "sound"))
+    lags = scan_lags(fan, sound, span, interval, max_lag, min_pairs)
     valid = [row for row in lags if row["pearson_r"] is not None]
-    peak = max(valid, key=lambda row: (
-        round(abs(row["pearson_r"]), 12), row["pair_count"], -abs(row["lag_samples"]), -row["lag_samples"],
-    ), default=None)
+    peak = select_peak(lags)
     headline, action = _interpret(peak, max_lag)
     gaps = _missing_periods(grid, span, start, interval, "整行未采集")
     for series, (_, label) in zip((fan, sound), _CHANNELS):

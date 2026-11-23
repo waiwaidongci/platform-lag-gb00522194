@@ -4,6 +4,7 @@ from sqlalchemy import and_, or_, select
 from src.config.database import Session
 from src.constants.enums import Status
 from src.domain.analysis import analyze
+from src.domain.interference import run_interference
 from src.domain.spec import SPEC
 from src.models.jobs import Delivery, Run, Schedule
 from src.models.source import Dataset
@@ -12,6 +13,9 @@ from src.utils.exports import write_report
 from src.utils.time import now
 
 log = logging.getLogger(__name__)
+
+# 抗干扰复核组合较多，租约按批续期，普通扫描不受影响。
+LEASE_MINUTES = 3
 
 
 def materialize_due():
@@ -56,16 +60,40 @@ def claim():
             return None
         job.status = Status.RUNNING
         job.attempt += 1
-        job.lease_until = stamp + timedelta(minutes=3)
+        job.lease_until = stamp + timedelta(minutes=LEASE_MINUTES)
         records = db.get(Dataset, job.dataset_id).rows
-        return job.id, job.attempt, records, job.params
+        return job.id, job.attempt, records, job.params, job.interference_checkpoint
+
+
+def _run_interference_with_lease(job_id, attempt, rows, params, checkpoint):
+    """分批枚举组合，每批续租并落检查点；中断后凭检查点续跑剩余组合。"""
+    def progress(evaluated, snapshot):
+        with Session.begin() as db:
+            job = db.get(Run, job_id, with_for_update=True)
+            # 已被其他执行者接管或取消时停止本执行者，避免重复判定。
+            if job is None or job.attempt != attempt or job.status != Status.RUNNING:
+                raise RuntimeError('运行已被接管，停止当前计算')
+            job.lease_until = now() + timedelta(minutes=LEASE_MINUTES)
+            job.interference_checkpoint = snapshot
+    return run_interference(rows, params, checkpoint=checkpoint, progress=progress)
 
 
 def execute(lease):
-    job_id, attempt, rows, params = lease
+    job_id, attempt, rows, params, checkpoint = lease
+    interference_enabled = bool(params.get('interference_enabled'))
     result = export = failure = None
     try:
         result = analyze(rows, params)
+        if interference_enabled:
+            # 普通扫描照常完成后，对选定批次追加抗干扰检查。
+            check = _run_interference_with_lease(job_id, attempt, rows, params, checkpoint)
+            result['interference'] = check
+            # 抗干扰指标、证据表和判定依据并入结果页与导出 CSV。
+            result['metrics'].extend(check['metrics'])
+            result['tables'].extend(check['tables'])
+            result['sections'].extend(
+                {'title': f"抗干扰复核 · {section['title']}", 'text': section['text']}
+                for section in check['sections'])
         export = write_report(job_id, attempt, result)
     except ValueError as error:
         failure = str(error)[:500]
@@ -82,6 +110,9 @@ def execute(lease):
         job.result = None if failure else result
         job.export_file = export
         job.error = failure
+        # 完成（含稳定/有反例/无峰）后清除检查点；失败则保留，重试不新增判定。
+        if not failure:
+            job.interference_checkpoint = None
         record(db, 'worker', f'analysis.{job.status}', job.id, attempt=attempt, reason=failure)
         if job.schedule_id:
             plan = db.get(Schedule, job.schedule_id)

@@ -8,6 +8,46 @@ import {workspace} from '../stores/workspace.js';
 import {button, el, h, link, p} from '../utils/dom.js';
 import {date, value} from '../utils/format.js';
 
+const INTERFERENCE_STATE = {stable:'抗干扰稳定', vulnerable:'存在干扰反例', no_peak:'原扫描无峰'};
+
+function peakText(peak) {
+  if (!peak) return '无可判读峰';
+  return `${peak.lag_samples >= 0 ? '+' : ''}${peak.lag_samples} 格（${peak.lag_seconds >= 0 ? '+' : ''}${peak.lag_seconds} 秒），r=${Number(peak.pearson_r).toFixed(4)}，${peak.pair_count} 对`;
+}
+
+function interferencePanel(check) {
+  if (!check) return null;
+  const original = el('div', {class:'interference-peak', 'data-testid':'interference-original'},
+    el('h3', {}, '原峰（未剔除任何时刻）'),
+    el('p', {class:'intro-copy'}, peakText(check.original_peak)),
+    p('剔除前后共用同一峰判法：按 |r| 取大、12 位小数比较，再依次比配对数、绝对滞后、滞后值。', 'subtle'));
+  const counter = check.counterexample;
+  const body = counter
+    ? el('div', {},
+        el('p', {class:'feedback'}, `最少剔除 ${counter.removal_count} 个声级时刻即${counter.kind}；同剔除数下取时间最早的一组，风机读数全程保留。`),
+        table([
+          {key:'order', label:'剔除次序'},
+          {key:'timestamp', label:'剔除的声级采样时刻'},
+          {key:'slot', label:'网格槽位'},
+          {key:'change', label:'峰变化'},
+          {label:'剔除后峰位', render:() => peakText(counter.new_peak)},
+        ], counter.removed_timestamps.map((stamp, index) => ({
+          order:index + 1, timestamp:stamp, slot:counter.removed_slots[index], change:counter.kind,
+        })), {caption:'抗干扰反例证据（同一组声级时刻）'}))
+    : p(check.state === 'stable'
+        ? `1 至 3 个声级时刻的组合已全部枚举（共 ${check.evaluated_combinations} 组），查全无反例，才报稳定。`
+        : '原扫描没有可判读的相关峰，已标明「原扫描无峰」，不进行组合剔除。', 'empty');
+  const basis = (check.sections || []).map(item => panel(item.title, p(item.text)));
+  return el('section', {class:'panel interference', 'data-testid':'interference-panel'},
+    h(2, `抗干扰复核 · ${INTERFERENCE_STATE[check.state] || check.state_label || ''}`),
+    p(check.headline, 'intro-copy'),
+    original,
+    metrics(check.metrics || []),
+    body,
+    ...basis);
+}
+
+
 export async function results(route, refresh) {
   const {spec,runs,datasets} = workspace;
   const id = route.id || runs[0]?.id;
@@ -36,6 +76,7 @@ export async function results(route, refresh) {
       el('div',{class:'actions'},pill(STATUS[job.status],job.status),download,message)),
     metrics(result.metrics),
     result.charts.map(plot),
+    interferencePanel(result.interference),
     (result.sections || []).map(item=>panel(item.title,p(item.text))),
     result.tables.map(item=>panel(item.title,table(item.columns,item.rows,{caption:item.title}))))
     : panel(job.name,pill(STATUS[job.status],job.status),p(job.error,'feedback'),link('返回调整参数',`#run/${job.dataset_id}`,{class:'quiet'}));
